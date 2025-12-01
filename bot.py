@@ -13,14 +13,14 @@ TELEGRAM_CHAT_IDS = ["5054484162", "497819952"]
 
 SCAN_THRESHOLD = 0.25       # Min % to shortlist candidates
 ALERT_THRESHOLD = 5.0       # Instant alert threshold in %
-ALERT_COOLDOWN = 60         # seconds - cooldown per symbol
+ALERT_COOLDOWN = 120        # seconds - increased from 60 to reduce calls
 SUMMARY_INTERVAL = 300      # not used in minute-window design but kept
-MAX_WORKERS = 12
+MAX_WORKERS = 4             # reduced from 12 to lower CPU/Billing
 
 MONITOR_DURATION = 60       # seconds per monitoring window (1 minute)
-MONITOR_POLL = 2            # seconds between polls during the monitoring window
-CONFIRM_RETRY_DELAY = 0.5   # seconds between initial detection and confirm re-check
-CONFIRM_RETRIES = 2         # how many confirm rechecks to do (fast, to reduce false positives)
+MONITOR_POLL = 5            # increased from 2 seconds to reduce API calls
+CONFIRM_RETRY_DELAY = 0.5   # unchanged
+CONFIRM_RETRIES = 1         # reduced from 2 to cut API calls
 # ==================================================================
 
 # API endpoints
@@ -69,17 +69,12 @@ def send_telegram(message):
 
 # -------------------- Utility / fetch functions --------------------
 def normalize(sym):
-    """Normalize symbol names to a common comparable form."""
     if not sym:
         return sym
     s = sym.upper()
-    # common KuCoin futures suffix: USDTM -> USDT
-    if s.endswith("USDTM"):
-        return s[:-1]
-    if s.endswith("USDTP"):
-        return s[:-1]
-    if s.endswith("M"):
-        return s[:-1]
+    if s.endswith("USDTM"): return s[:-1]
+    if s.endswith("USDTP"): return s[:-1]
+    if s.endswith("M"): return s[:-1]
     return s
 
 def get_binance_symbols(retries=2):
@@ -128,7 +123,6 @@ def get_common_symbols():
         n = normalize(s)
         if n in ku_map and ku_map[n] != s:
             dup_count += 1
-            # keep first and warn in debug
         else:
             ku_map[n] = s
     if dup_count:
@@ -137,7 +131,6 @@ def get_common_symbols():
     return common, ku_map
 
 def get_binance_book(retries=1):
-    """Fetch full binance bookTicker list and return dict symbol->{bid,ask}"""
     for attempt in range(1, retries+1):
         try:
             r = requests.get(BINANCE_BOOK_URL, timeout=10)
@@ -148,7 +141,6 @@ def get_binance_book(retries=1):
                 try:
                     out[d["symbol"]] = {"bid": float(d["bidPrice"]), "ask": float(d["askPrice"])}
                 except Exception:
-                    # skip bad entries
                     continue
             logger.debug("[BINANCE_BOOK] entries: %d", len(out))
             return out
@@ -159,7 +151,6 @@ def get_binance_book(retries=1):
             time.sleep(0.5)
 
 def get_binance_price(symbol, session, retries=1):
-    """Fetch single-symbol binance bookTicker"""
     for attempt in range(1, retries+1):
         try:
             url = BINANCE_TICKER_URL.format(symbol=symbol)
@@ -181,7 +172,6 @@ def get_binance_price(symbol, session, retries=1):
             time.sleep(0.2)
 
 def get_kucoin_price_once(symbol, session, retries=1):
-    """Fetch single-symbol KuCoin ticker (futures)"""
     for attempt in range(1, retries+1):
         try:
             url = KUCOIN_TICKER_URL.format(symbol=symbol)
@@ -204,7 +194,6 @@ def get_kucoin_price_once(symbol, session, retries=1):
             time.sleep(0.2)
 
 def threaded_kucoin_prices(symbols):
-    """Parallel fetch of KuCoin prices for a list of symbols (original KuCoin symbol forms)"""
     prices = {}
     if not symbols:
         return prices
@@ -225,14 +214,11 @@ def threaded_kucoin_prices(symbols):
 
 # -------------------- Spread calculation --------------------
 def calculate_spread(bin_bid, bin_ask, ku_bid, ku_ask):
-    """Return positive spread when KuCoin bid > Binance ask (long bin, short ku),
-       negative spread when KuCoin ask < Binance bid (long ku, short bin)"""
     try:
         if not all([bin_bid, bin_ask, ku_bid, ku_ask]) or bin_ask <= 0 or bin_bid <= 0:
             return None
         pos = ((ku_bid - bin_ask) / bin_ask) * 100
         neg = ((ku_ask - bin_bid) / bin_bid) * 100
-        # we return whichever side exceeds ±0.01% (tiny threshold)
         if pos > 0.01:
             return pos
         if neg < -0.01:
@@ -254,7 +240,6 @@ def main():
     while True:
         window_start = time.time()
         try:
-            # 1) Full scan once at start of window
             common_symbols, ku_map = get_common_symbols()
             if not common_symbols:
                 logger.warning("No common symbols — retrying after short sleep")
@@ -292,11 +277,10 @@ def main():
                 time.sleep(to_sleep)
                 continue
 
-            # 2) Focused monitoring for MONITOR_DURATION seconds
             window_end = window_start + MONITOR_DURATION
             while time.time() < window_end and candidates:
                 round_start = time.time()
-                # fetch prices for each candidate in parallel (both exchanges)
+
                 workers = min(MAX_WORKERS, max(4, len(candidates)))
                 latest = {s: {"bin": None, "ku": None} for s in list(candidates.keys())}
 
@@ -304,7 +288,7 @@ def main():
                     fut_map = {}
                     for sym, info in list(candidates.items()):
                         ku_sym = info["ku_sym"]
-                        b_symbol = sym  # assuming 'sym' matches Binance symbol format; adjust if needed
+                        b_symbol = sym
                         fut_map[ex.submit(get_binance_price, b_symbol, http_session)] = ("bin", sym)
                         fut_map[ex.submit(get_kucoin_price_once, ku_sym, http_session)] = ("ku", sym)
 
@@ -317,7 +301,6 @@ def main():
                         if bid and ask:
                             latest[sym][typ] = {"bid": bid, "ask": ask}
 
-                # evaluate spreads for candidates with both prices
                 for sym in list(candidates.keys()):
                     info = candidates.get(sym)
                     if not info:
@@ -330,23 +313,19 @@ def main():
                     if spread is None:
                         continue
 
-                    # update per-symbol max/min
                     if spread > info["max_spread"]:
                         candidates[sym]["max_spread"] = spread
                     if spread < info["min_spread"]:
                         candidates[sym]["min_spread"] = spread
 
-                    # If threshold hit -> do confirm re-checks before alerting
                     if abs(spread) >= ALERT_THRESHOLD:
                         now = time.time()
                         cooldown_ok = (sym not in last_alert) or (now - last_alert[sym] > ALERT_COOLDOWN)
                         if not cooldown_ok:
                             logger.debug("Alert suppressed by cooldown for %s", sym)
-                            # mark alerted for minute to avoid repeated checks
                             candidates[sym]["alerted"] = True
                             continue
 
-                        # Immediate confirm re-checks (fast small number)
                         confirmed = False
                         for attempt in range(CONFIRM_RETRIES):
                             time.sleep(CONFIRM_RETRY_DELAY)
@@ -357,16 +336,13 @@ def main():
                                 logger.debug("Confirm check %d for %s: %.4f%%", attempt+1, sym, spread2 if spread2 is not None else 0)
                                 if spread2 is not None and abs(spread2) >= ALERT_THRESHOLD:
                                     confirmed = True
-                                    # use the confirmed numbers for alert message
                                     b_confirm, k_confirm = {"bid": b2_bid, "ask": b2_ask}, {"bid": k2_bid, "ask": k2_ask}
                                     break
                         if not confirmed:
                             logger.info("False positive avoided for %s (initial %.4f%%)", sym, spread)
-                            # mark as checked so we won't spam rechecks immediately; keep monitoring though
                             candidates[sym]["alerted"] = False
                             continue
 
-                        # Send alert (confirmed)
                         direction = "Long Binance / Short KuCoin" if spread2 > 0 else "Long KuCoin / Short Binance"
                         msg = (
                             f"*BIG SPREAD ALERT*\n"
@@ -379,10 +355,8 @@ def main():
                         send_telegram(msg)
                         logger.info("ALERT → %s %+.4f%% (confirmed)", sym, spread2)
                         last_alert[sym] = time.time()
-                        # remove from monitoring for remaining minute to reduce API calls
                         candidates.pop(sym, None)
 
-                # sleep until next poll round (but cap to window_end)
                 elapsed = time.time() - round_start
                 sleep_for = MONITOR_POLL - elapsed
                 if sleep_for > 0:
@@ -391,7 +365,6 @@ def main():
                     if sleep_for > 0:
                         time.sleep(sleep_for)
 
-            # 3) End of window summary: compute observed extremes
             overall_max = None; overall_max_sym = None
             overall_min = None; overall_min_sym = None
             for sym, info in candidates.items():
@@ -413,7 +386,6 @@ def main():
             send_telegram(summary)
             logger.info("Summary sent for window starting %s", timestamp())
 
-            # align to minute boundary: if we finished early, sleep remaining part of MONITOR_DURATION
             elapsed_total = time.time() - window_start
             if elapsed_total < MONITOR_DURATION:
                 time.sleep(max(0.2, MONITOR_DURATION - elapsed_total))
